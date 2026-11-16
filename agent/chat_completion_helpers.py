@@ -2099,7 +2099,7 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
 # in the main loop; the summary path calls chat.completions.create() directly, so mirror it.
 _SUMMARY_FOREIGN_MESSAGE_KEYS = PERSISTENCE_ONLY_MESSAGE_FIELDS | {"reasoning", "finish_reason", "tool_name",
     "codex_reasoning_items", "codex_message_items", "platform_message_id"}
-_EMPTY_SUMMARY_RESPONSE = "I reached the iteration limit and couldn't generate a summary."
+_EMPTY_SUMMARY_RESPONSE = ""  # sentinel: an empty summary is a failure, never the reply
 
 
 def _iteration_summary_api_messages(agent, messages: list) -> list:
@@ -2247,13 +2247,56 @@ def _chat_summary_attempt(agent, api_messages: list, api_request_id: str):
         summary_kwargs["_moa_prepared_request"] = agent.client.chat.completions.prepare(api_messages)
 
     def _attempt(retry_count: int) -> str:
+        # Attempt 0 keeps the cached prefix (tools offered). Models that answer the summary
+        # nudge with more tool calls would then loop on an empty summary forever, so later
+        # attempts forbid tools: first tool_choice="none", then no tools at all.
+        kwargs = summary_kwargs
+        if retry_count >= 1 and kwargs.get("tools"):
+            kwargs = dict(summary_kwargs)
+            if retry_count == 1:
+                kwargs["tool_choice"] = "none"
+            else:
+                for key in ("tools", "tool_choice", "parallel_tool_calls"):
+                    kwargs.pop(key, None)
         # Use the ordinary request-local lifecycle: a summary can be interrupted
         # during a long prefill without closing the shared primary client.
         response = _managed_summary_call(
-            agent, api_request_id, summary_kwargs, agent._interruptible_api_call,
+            agent, api_request_id, kwargs, agent._interruptible_api_call,
             retry_count=retry_count)
         return _summary_text(agent, response)
     return _attempt
+
+
+def _local_progress_summary(agent, messages: list) -> str:
+    """Deterministic last-resort summary built from the transcript, so the turn never ends
+    with a bare "couldn't generate a summary" line."""
+    from collections import Counter
+    tools: Counter = Counter()
+    last_text = ""
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        for call in msg.get("tool_calls") or []:
+            fn = call.get("function") if isinstance(call, dict) else getattr(call, "function", None)
+            name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
+            if name:
+                tools[name] += 1
+        content = msg.get("content")
+        if isinstance(content, list):
+            content = " ".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
+        if isinstance(content, str):
+            content = re.sub(r'<think>.*?</think>\s*', '', content, flags=re.DOTALL).strip()
+            if content:
+                last_text = content
+    lines = [f"I hit the step limit ({agent.max_iterations} tool calls) before finishing, and the model "
+             "wouldn't write a summary, so here's what the transcript shows:"]
+    if tools:
+        lines.append("- Tools used: " + ", ".join(f"{n} ×{c}" for n, c in tools.most_common(8)))
+    if last_text:
+        snippet = last_text if len(last_text) <= 1200 else last_text[:1200].rstrip() + "…"
+        lines.append("- Last progress note:\n\n" + snippet)
+    lines.append("\nSend `continue` to pick up where I left off.")
+    return "\n".join(lines)
 
 
 _SUMMARY_ATTEMPT_BUILDERS = {"codex_responses": _codex_summary_attempt, "anthropic_messages": _anthropic_summary_attempt}
@@ -2282,11 +2325,15 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         build_attempt = _SUMMARY_ATTEMPT_BUILDERS.get(agent.api_mode, _chat_summary_attempt)
         attempt = build_attempt(agent, api_messages, summary_api_request_id)
 
-        # One retry on an empty summary; a summary empty once its <think> block is stripped is NOT retried.
-        final_response = _EMPTY_SUMMARY_RESPONSE
-        for retry_count in (0, 1):
-            text = attempt(retry_count)
-            if not text:
+        # Retries on an empty or failed summary attempt. A reasoning-only response
+        # (thinking block stripped to nothing) also counts as empty and gets another
+        # try, so the turn never ends with the canned "couldn't generate a summary"
+        # line when the model can actually summarise.
+        for retry_count in (0, 1, 2):
+            try:
+                text = attempt(retry_count)
+            except Exception as retry_error:
+                logger.warning("Iteration summary attempt %d failed: %s", retry_count, retry_error)
                 continue
             if "<think>" in text:
                 text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
@@ -2294,7 +2341,11 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 summary_call_outcome = "success"
                 append_message(messages, {"role": "assistant", "content": text})
                 final_response = text
-            break
+                break
+        else:
+            # Every attempt came back empty: never return a bare "couldn't generate a
+            # summary" line — summarise from the transcript instead.
+            final_response = _local_progress_summary(agent, messages)
 
     except InterruptedError:
         # Cancellation is not a summary failure: drop the unanswered nudge and let the
@@ -2305,8 +2356,11 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         raise
     except Exception as e:
         logger.warning("Failed to get summary response: %s", e)
-        from agent.turn_failure_copy import site_copy
-        final_response = site_copy("max_iterations_no_summary", limit=agent.max_iterations)
+        try:
+            final_response = _local_progress_summary(agent, messages)
+        except Exception:
+            from agent.turn_failure_copy import site_copy
+            final_response = site_copy("max_iterations_no_summary", limit=agent.max_iterations)
     finally:
         from agent import relay_llm
         relay_llm.complete_logical_call(summary_api_request_id, outcome=summary_call_outcome)
