@@ -2,6 +2,7 @@ import { skillInvocationText } from '@hermes/shared'
 import { mergeUsage, parseCommandDispatch, parseSlashCommand, randomUuid } from '@hermes/shared'
 import { type MutableRefObject, useCallback, useRef } from 'react'
 
+import { requestComposerInsert } from '@/app/chat/composer/focus'
 import { mergeOlderTranscriptPage } from '@/app/chat/transcript-backfill'
 import { prepareDefaultNewSession } from '@/app/session/new-session-route'
 import { invalidateContextBreakdown } from '@/app/shell/hooks/use-context-breakdown'
@@ -648,9 +649,24 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           withSlashOutput
         }),
         ...desktopReadCommandHandlers<SlashActionCtx>({ requestGateway, updateSessionState, withSlashOutput }),
-        new: async () => {
+        new: async ctx => {
           prepareDefaultNewSession()
           startFreshSessionDraft()
+          // `/new <text>` used to drop its argument: the desktop handler takes no
+          // arg and the submit chain had already cleared the composer, so the
+          // payload was lost and no session was minted (a session is created
+          // by the NEXT send from the fresh draft). Hand the argument to the
+          // fresh draft instead: it shows in the new chat's composer as an
+          // ordinary prompt, and the send that follows mints the session and
+          // auto-titles it. An argument that is itself a slash command
+          // (`/new /compress`) is inserted verbatim rather than executed —
+          // executing it would target the just-freshened draft, and that
+          // invocation already read as one command to the dispatcher.
+          const arg = ctx.arg.trim()
+
+          if (arg) {
+            requestComposerInsert(arg, { mode: 'block', target: 'main' })
+          }
         },
         branch: async () => {
           await branchCurrentSession()
